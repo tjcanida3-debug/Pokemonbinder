@@ -45,49 +45,48 @@ class Catalog(context: Context) {
         return readCards(arr)
     }
 
-    // Search across all sets by the card title and, where available, printed card number.
-    // The scanner only offers suggestions: the user chooses the final match.
+    // Search for the title actually printed on the card, not a generic word
+    // from its instructions. Broad guesses made "Poké Pad" look like "Item Finder".
     suspend fun findScannedCandidates(recognizedText: String): List<TradingCard> {
-        val titleLines = recognizedText.lineSequence()
-            .map { it.trim() }
-            .filter { it.length in 3..38 && it.any { character -> character.isLetter() } }
-            .take(15)
-            .map { it.replace(Regex("(?i)^(basic|stage\\s*[0-2]|special)\\s+"), "")
-                .replace(Regex("(?i)\\bHP\\s*\\d+.*"), "")
-                .replace(Regex("[^A-Za-z0-9 '’-]"), " ")
-                .replace(Regex("\\s+"), " ").trim() }
-            .filter { it.length in 4..32 && it.any { character -> character.isLetter() } &&
-                !it.matches(Regex("(?i)^(ENERGY|TRAINER|POK[EÉ]MON|BASIC|STAGE).*")) &&
-                it.split(' ').size <= 5 }
-            .toList()
-        val queries = linkedSetOf<String>()
-        for (line in titleLines) {
-            queries.add(line)
-            // Include the first title word when OCR mixes a title with a rarity label.
-            if (line.contains(' ') && line.split(' ').first().length >= 5) {
-                queries.add(line.split(' ').first())
-            }
-            if (queries.size >= 4) break
-        }
-        val cards = linkedMapOf<String, TradingCard>()
-        for (name in queries.take(4)) {
+        val titles = ScanIdentity.titles(recognizedText)
+        if (titles.isEmpty()) return emptyList()
+        for (title in titles.take(2)) {
+            val found = linkedMapOf<String, TradingCard>()
+            val exactUrl = "cards?name=" +
+                URLEncoder.encode("eq:" + title, "UTF-8") +
+                "&pagination:itemsPerPage=100"
             try {
-                val encoded = URLEncoder.encode(name, "UTF-8")
-                val arr = JSONArray(json("cards?name=" + encoded + "&pagination:itemsPerPage=90"))
-                readCards(arr).forEach { cards[it.id] = it }
-            } catch (_: Exception) { /* try remaining titles */ }
-        }
-        if (cards.isEmpty()) {
-            val number = Regex("(?<!\\d)([0-9]{1,3})\\s*[/|]\\s*[0-9]{2,3}")
-                .find(recognizedText)?.groupValues?.get(1)
-            if (number != null) {
+                readCards(JSONArray(json(exactUrl))).forEach { found[it.id] = it }
+            } catch (_: Exception) {}
+            if (found.isEmpty()) {
+                val query = "cards?name=" +
+                    URLEncoder.encode(title, "UTF-8") +
+                    "&pagination:itemsPerPage=150"
                 try {
-                    readCards(JSONArray(json("cards?localId=eq:" + number + "&pagination:itemsPerPage=90")))
-                        .forEach { cards[it.id] = it }
+                    readCards(JSONArray(json(query))).forEach { found[it.id] = it }
                 } catch (_: Exception) {}
             }
+            if (found.isEmpty()) {
+                // If OCR left off an accent, search by a distinctive title word.
+                val parts = ScanIdentity.key(title).split(' ')
+                val fallback = parts.filter {
+                    it.length >= 3 && it !in setOf("basic", "energy", "item", "trainer",
+                        "pokemon", "the", "and", "card")
+                }.lastOrNull()
+                if (fallback != null) {
+                    try {
+                        val query = "cards?name=" + URLEncoder.encode(fallback, "UTF-8") +
+                            "&pagination:itemsPerPage=200"
+                        readCards(JSONArray(json(query))).forEach { found[it.id] = it }
+                    } catch (_: Exception) {}
+                }
+            }
+            val matches = ScanIdentity.match(recognizedText, found.values.toList())
+            if (matches.isNotEmpty()) return matches
         }
-        return matchScannedCard(recognizedText, cards.values.toList())
+        // An unidentifiable Energy card or incomplete OCR is safer to retry
+        // than an unrelated printing silently added to the binder.
+        return emptyList()
     }
 
     private fun readCards(arr: JSONArray): List<TradingCard> =

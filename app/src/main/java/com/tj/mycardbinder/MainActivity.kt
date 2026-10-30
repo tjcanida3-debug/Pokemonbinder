@@ -76,7 +76,9 @@ private fun BinderScreen() {
     var scannerOpen by remember { mutableStateOf(false) }
     var scanMatching by remember { mutableStateOf(false) }
     var scanHint by remember { mutableStateOf("Point your camera at one card and hold steady") }
-    var lastScanFingerprint by remember { mutableStateOf("") }
+    var lastObservedTitle by remember { mutableStateOf("") }
+    var stableFrames by remember { mutableIntStateOf(0) }
+    var lastQueriedTitle by remember { mutableStateOf("") }
     var lastScanAt by remember { mutableLongStateOf(0L) }
     var suggestions by remember { mutableStateOf<List<TradingCard>?>(null) }
     var scanText by remember { mutableStateOf("") }
@@ -148,32 +150,46 @@ private fun BinderScreen() {
             onClose = { scannerOpen = false; scanMatching = false },
             onError = { scanHint = it },
             onTextDetected = { recognized ->
-                val fingerprint = recognized.lowercase().replace(Regex("[^a-z0-9]+"), " ").trim()
-                val now = SystemClock.elapsedRealtime()
-                if (!scanMatching && fingerprint.isNotBlank() &&
-                    (fingerprint != lastScanFingerprint || now - lastScanAt > 8000L)) {
-                    lastScanFingerprint = fingerprint
-                    lastScanAt = now
-                    scanMatching = true
-                    scanHint = "Matching your card against the catalog…"
-                    scanText = recognized
-                    scope.launch {
-                        try {
-                            val matches = if (currentSet != null && cards.isNotEmpty()) {
-                                matchScannedCard(recognized, cards)
-                            } else {
-                                catalog.findScannedCandidates(recognized)
+                val title = ScanIdentity.titles(recognized).firstOrNull()
+                if (title == null) {
+                    scanHint = if (recognized.contains("Basic Energy", true))
+                        "Basic Energy cards need a readable title or collector number. Move closer to the bottom edge."
+                    else "Hold the card steady and center the printed name."
+                    stableFrames = 0
+                    lastObservedTitle = ""
+                } else {
+                    val identity = ScanIdentity.key(title)
+                    if (identity == lastObservedTitle) stableFrames += 1
+                    else { lastObservedTitle = identity; stableFrames = 1 }
+                    val now = SystemClock.elapsedRealtime()
+                    scanHint = "Reading " + title + "… hold steady"
+                    if (stableFrames >= 2 && !scanMatching &&
+                        (identity != lastQueriedTitle || now - lastScanAt > 10000L)) {
+                        lastQueriedTitle = identity
+                        lastScanAt = now
+                        stableFrames = 0
+                        scanMatching = true
+                        scanHint = "Looking up " + title + "…"
+                        scanText = recognized
+                        scope.launch {
+                            try {
+                                val matches = if (currentSet != null && cards.isNotEmpty()) {
+                                    matchScannedCard(recognized, cards)
+                                } else {
+                                    catalog.findScannedCandidates(recognized)
+                                }
+                                if (matches.isNotEmpty()) {
+                                    suggestions = matches
+                                    scannerOpen = false
+                                } else {
+                                    scanHint = "No exact match for " + title +
+                                        ". Try better light or select its set manually."
+                                }
+                            } catch (ex: Exception) {
+                                scanHint = "Search unavailable. Check internet and try again."
+                            } finally {
+                                scanMatching = false
                             }
-                            if (matches.isNotEmpty()) {
-                                suggestions = matches
-                                scannerOpen = false
-                            } else {
-                                scanHint = "No match yet. Move closer, use better lighting or another angle."
-                            }
-                        } catch (ex: Exception) {
-                            scanHint = "Search failed. Check internet and try again."
-                        } finally {
-                            scanMatching = false
                         }
                     }
                 }
@@ -392,33 +408,72 @@ private fun BinderScreen() {
     }
 
     suggestions?.let { matches ->
-        AlertDialog(onDismissRequest = { suggestions = null }, title = { Text("Confirm scanned card") },
+        AlertDialog(
+            onDismissRequest = { suggestions = null },
+            title = { Text("Check your card", fontWeight = FontWeight.Bold) },
             text = {
-                Column(Modifier.heightIn(max = 410.dp).verticalScroll(rememberScrollState())) {
+                Column(Modifier.heightIn(max = 430.dp).verticalScroll(rememberScrollState())) {
+                    Text("The camera read: " +
+                        (ScanIdentity.titles(scanText).firstOrNull() ?: "Card title uncertain"),
+                        color = brightGold, fontWeight = FontWeight.SemiBold)
+                    Spacer(Modifier.height(5.dp))
+                    Text("Compare the picture and number. Tap only the exact edition you own.",
+                        color = mutedText, style = MaterialTheme.typography.bodySmall)
+                    Spacer(Modifier.height(12.dp))
                     if (matches.isEmpty()) {
-                        Text("No match yet. Try scanning again or select a set manually.")
+                        Text("No reliable match. Scan again or add it from the set checklist.")
                     } else {
-                        Text("Choose the correct card. Nothing is saved until you choose.")
-                        Spacer(Modifier.height(10.dp))
-                        matches.forEach { card ->
-                            OutlinedButton(onClick = {
-                                val n = owned[inventoryKey(card.id, Finish.REGULAR)] ?: 0
-                                setCount(card.id, Finish.REGULAR, n + 1)
-                                suggestions = null
-                                selectedCard = card
-                            }, modifier = Modifier.fillMaxWidth()) {
-                                Text("${card.name}  #${card.localId} (${card.id.substringBeforeLast('-')})")
+                        matches.take(10).forEach { card ->
+                            val setId = card.id.substringBeforeLast('-')
+                            val setName = sets.find { it.id == setId }?.name ?: setId
+                            ElevatedCard(
+                                onClick = {
+                                    val n = owned[inventoryKey(card.id, Finish.REGULAR)] ?: 0
+                                    setCount(card.id, Finish.REGULAR, n + 1)
+                                    suggestions = null
+                                    selectedCard = card
+                                },
+                                modifier = Modifier.fillMaxWidth().padding(bottom = 9.dp),
+                                colors = CardDefaults.elevatedCardColors(containerColor = Color(0xFF26344B))
+                            ) {
+                                Row(Modifier.fillMaxWidth().padding(9.dp),
+                                    verticalAlignment = Alignment.CenterVertically) {
+                                    CardArtwork(card.imageBase,
+                                        Modifier.width(57.dp).height(79.dp))
+                                    Spacer(Modifier.width(10.dp))
+                                    Column(Modifier.weight(1f)) {
+                                        Text(card.name, color = paleText,
+                                            style = MaterialTheme.typography.titleSmall,
+                                            fontWeight = FontWeight.Bold)
+                                        Text(setName, color = mutedText,
+                                            style = MaterialTheme.typography.bodySmall)
+                                        Text("#" + card.localId, color = brightGold,
+                                            style = MaterialTheme.typography.labelLarge)
+                                    }
+                                    Text("+", color = brightGold, fontWeight = FontWeight.Black,
+                                        style = MaterialTheme.typography.titleLarge)
+                                }
                             }
                         }
                     }
-                    Spacer(Modifier.height(12.dp))
-                    Text("Camera recognized:", fontWeight = FontWeight.SemiBold)
-                    Text(scanText.take(320).ifBlank { "No readable text" },
-                        style = MaterialTheme.typography.bodySmall, color = mutedText)
+                    Text("Nothing is saved until you choose a card.",
+                        color = mutedText, style = MaterialTheme.typography.labelSmall)
                 }
-            }, confirmButton = {
-                TextButton(onClick = { suggestions = null; scannerOpen = true }) { Text("Scan again") }
-            })
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    suggestions = null
+                    lastScanAt = 0L
+                    lastQueriedTitle = ""
+                    lastObservedTitle = ""
+                    stableFrames = 0
+                    startScan()
+                }) { Text("Scan again") }
+            },
+            dismissButton = {
+                TextButton(onClick = { suggestions = null }) { Text("Close") }
+            }
+        )
     }
 }
 
