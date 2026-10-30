@@ -27,6 +27,8 @@ import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import java.io.File
+import java.text.NumberFormat
+import java.util.Locale
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -49,6 +51,8 @@ private fun BinderScreen() {
     val context = LocalContext.current
     val catalog = remember { Catalog(context.applicationContext) }
     val store = remember { CollectionStore(context.applicationContext) }
+    val priceCatalog = remember { PriceCatalog(context.applicationContext) }
+    val marketPrices = remember { mutableStateMapOf<String, MarketPrices>().apply { putAll(priceCatalog.cachedAll()) } }
     val owned = remember { mutableStateMapOf<String, Int>().apply { putAll(store.load()) } }
     var sets by remember { mutableStateOf<List<CardSet>>(emptyList()) }
     var currentSet by remember { mutableStateOf<CardSet?>(null) }
@@ -137,6 +141,11 @@ private fun BinderScreen() {
         }
     }
 
+    LaunchedEffect(selectedCard?.id) {
+        val card = selectedCard ?: return@LaunchedEffect
+        marketPrices[card.id] = priceCatalog.get(card.id)
+    }
+
     Scaffold { inset ->
         Column(
             Modifier.fillMaxSize().padding(inset).padding(horizontal = 16.dp)
@@ -152,6 +161,11 @@ private fun BinderScreen() {
                         Text("Unique cards owned")
                         Text(unique.toString(), style = MaterialTheme.typography.headlineLarge)
                         Text(sets.size.toString() + " sets available", style = MaterialTheme.typography.bodySmall)
+                        val estimate = collectionEstimate(owned, marketPrices)
+                        if (estimate.second > 0) {
+                            Text("Known collection value: " + formatMarket(estimate.first), fontWeight = FontWeight.SemiBold)
+                            Text(estimate.second.toString() + " priced copies; unpriced cards excluded", style = MaterialTheme.typography.bodySmall)
+                        } else Text("Open a set to load estimated card values", style = MaterialTheme.typography.bodySmall)
                     }
                 }
                 Spacer(Modifier.height(12.dp))
@@ -202,6 +216,8 @@ private fun BinderScreen() {
                     else ownedInSet(set.id, owned)
                 val total = if (cards.isNotEmpty()) cards.size else set.count
                 Text(count.toString() + " / " + total + " cards owned")
+                val setEstimate = collectionEstimate(owned, marketPrices, set.id)
+                if (setEstimate.second > 0) Text("Known set value: " + formatMarket(setEstimate.first), style = MaterialTheme.typography.bodySmall)
                 Spacer(Modifier.height(8.dp))
                 LinearProgressIndicator(
                     progress = { if (total > 0) count.toFloat() / total else 0f },
@@ -236,7 +252,12 @@ private fun BinderScreen() {
                     verticalArrangement = Arrangement.spacedBy(7.dp)
                 ) {
                     items(filtered, key = { it.id }) { card ->
+                        LaunchedEffect(card.id) { marketPrices[card.id] = priceCatalog.get(card.id) }
                         val num = totalOwned(card.id, owned)
+                        val preferred = Finish.entries.firstOrNull { (owned[inventoryKey(card.id, it)] ?: 0) > 0 } ?: Finish.REGULAR
+                        val quote = marketPrices[card.id]
+                        val quoteValue = quote?.forFinish(preferred)
+                            ?: if (num == 0) quote?.byFinish?.values?.minOrNull() else null
                         ElevatedCard(
                             onClick = { selectedCard = card },
                             modifier = Modifier.fillMaxWidth()
@@ -252,6 +273,10 @@ private fun BinderScreen() {
                                         fontWeight = FontWeight.SemiBold)
                                     Text("#" + card.localId + " · " + num + " owned",
                                         style = MaterialTheme.typography.bodySmall)
+                                }
+                                Column(horizontalAlignment = Alignment.End, modifier = Modifier.width(77.dp)) {
+                                    Text(quoteValue?.let { formatMarket(it) } ?: if (quote != null) "N/A" else "…", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+                                    Text("market · USD", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 }
                                 Checkbox(
                                     checked = num > 0,
@@ -276,11 +301,14 @@ private fun BinderScreen() {
                 ) {
                     CardArtwork(card.imageBase, Modifier.fillMaxWidth().height(215.dp))
                     Text("Card #" + card.localId)
+                    Text("TCGplayer market estimates in USD", style = MaterialTheme.typography.bodySmall)
+                    Text(marketPrices[card.id]?.updatedAt?.let { "Updated: " + it.take(10) } ?: "Prices may be unavailable", style = MaterialTheme.typography.bodySmall)
                     Spacer(Modifier.height(10.dp))
                     Finish.entries.forEach { finish ->
                         val count = owned[inventoryKey(card.id, finish)] ?: 0
                         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                             Text(finish.title, modifier = Modifier.weight(1f))
+                            Text(marketPrices[card.id]?.forFinish(finish)?.let { formatMarket(it) } ?: "—", style = MaterialTheme.typography.labelSmall)
                             TextButton(
                                 onClick = { setCount(card.id, finish, count - 1) },
                                 enabled = count > 0
@@ -289,6 +317,7 @@ private fun BinderScreen() {
                             TextButton(onClick = { setCount(card.id, finish, count + 1) }) { Text("+") }
                         }
                     }
+                    Text("Prices are estimates for ungraded cards; condition can change the value.", style = MaterialTheme.typography.bodySmall)
                     Text("Choose finishes that actually exist for your card.",
                         style = MaterialTheme.typography.bodySmall)
                 }
@@ -329,6 +358,29 @@ private fun BinderScreen() {
             confirmButton = { TextButton(onClick = { suggestions = null }) { Text("Cancel") } }
         )
     }
+}
+
+
+private fun formatMarket(value: Double): String =
+    NumberFormat.getCurrencyInstance(Locale.US).format(value)
+
+private fun collectionEstimate(
+    inventory: Map<String, Int>,
+    prices: Map<String, MarketPrices>,
+    setId: String? = null
+): Pair<Double, Int> {
+    var total = 0.0
+    var pricedCopies = 0
+    inventory.forEach { (key, quantity) ->
+        if (quantity <= 0) return@forEach
+        val id = key.substringBefore('|')
+        if (setId != null && !id.startsWith(setId + "-")) return@forEach
+        val finish = Finish.entries.firstOrNull { it.name == key.substringAfter('|', "") } ?: return@forEach
+        val quote = prices[id]?.forFinish(finish) ?: return@forEach
+        total += quantity * quote
+        pricedCopies += quantity
+    }
+    return total to pricedCopies
 }
 
 private fun ownedInSet(setId: String, inventory: Map<String, Int>): Int =
