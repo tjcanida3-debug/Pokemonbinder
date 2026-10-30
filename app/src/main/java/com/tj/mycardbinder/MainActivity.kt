@@ -1,6 +1,9 @@
 package com.tj.mycardbinder
 
-import android.net.Uri
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.SystemClock
+import androidx.core.content.ContextCompat
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -27,13 +30,8 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.core.content.FileProvider
 import coil.compose.AsyncImage
-import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.text.TextRecognition
-import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.launch
-import java.io.File
 import java.text.NumberFormat
 import java.util.Locale
 
@@ -75,8 +73,11 @@ private fun BinderScreen() {
     var cardsSearch by remember { mutableStateOf("") }
     var missingOnly by remember { mutableStateOf(false) }
     var selectedCard by remember { mutableStateOf<TradingCard?>(null) }
-    var photoUri by remember { mutableStateOf<Uri?>(null) }
-    var scanning by remember { mutableStateOf(false) }
+    var scannerOpen by remember { mutableStateOf(false) }
+    var scanMatching by remember { mutableStateOf(false) }
+    var scanHint by remember { mutableStateOf("Point your camera at one card and hold steady") }
+    var lastScanFingerprint by remember { mutableStateOf("") }
+    var lastScanAt by remember { mutableLongStateOf(0L) }
     var suggestions by remember { mutableStateOf<List<TradingCard>?>(null) }
     var scanText by remember { mutableStateOf("") }
 
@@ -110,55 +111,28 @@ private fun BinderScreen() {
         }
     }
 
-    val camera = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { captured ->
-        val uri = photoUri
-        if (!captured || uri == null) {
-            scanning = false
+    val cameraPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            scanHint = "Point your camera at one card and hold steady"
+            scanMatching = false
+            scannerOpen = true
         } else {
-            try {
-                val image = InputImage.fromFilePath(context, uri)
-                val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
-                recognizer.process(image)
-                    .addOnSuccessListener { result ->
-                        scanText = result.text
-                        scope.launch {
-                            try {
-                                // Home scan searches every set. In a set, start with that set.
-                                suggestions = if (currentSet != null && cards.isNotEmpty()) {
-                                    matchScannedCard(result.text, cards)
-                                } else {
-                                    catalog.findScannedCandidates(result.text)
-                                }
-                            } catch (ex: Exception) {
-                                suggestions = emptyList()
-                                message = "Card search failed: " + (ex.localizedMessage ?: "Check your internet")
-                            } finally { scanning = false }
-                        }
-                    }
-                    .addOnFailureListener { ex ->
-                        message = "Could not read card: " + (ex.localizedMessage ?: "Try better lighting")
-                        scanning = false
-                    }
-                    .addOnCompleteListener { recognizer.close() }
-            } catch (ex: Exception) {
-                message = "Could not open photo: " + (ex.localizedMessage ?: "Unknown error")
-                scanning = false
-            }
+            message = "Allow camera permission to use live scanning. Manual checklists still work."
         }
     }
 
     fun startScan() {
-        try {
-            val folder = File(context.cacheDir, "scans").apply { mkdirs() }
-            val file = File(folder, "card_" + System.currentTimeMillis() + ".jpg")
-            val uri = FileProvider.getUriForFile(context, context.packageName + ".fileprovider", file)
-            photoUri = uri
-            scanning = true
-            message = null
-            camera.launch(uri)
-        } catch (ex: Exception) {
-            scanning = false
-            message = "Camera unavailable: " + (ex.localizedMessage ?: "Unknown error")
+        message = null
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            scanHint = "Point your camera at one card and hold steady"
+            scanMatching = false
+            scannerOpen = true
+        } else {
+            cameraPermission.launch(Manifest.permission.CAMERA)
         }
     }
 
@@ -167,7 +141,45 @@ private fun BinderScreen() {
         marketPrices[card.id] = priceCatalog.get(card.id)
     }
 
-    Scaffold(containerColor = midnight) { inset ->
+    if (scannerOpen) {
+        LiveCardScannerScreen(
+            isMatching = scanMatching,
+            status = scanHint,
+            onClose = { scannerOpen = false; scanMatching = false },
+            onError = { scanHint = it },
+            onTextDetected = { recognized ->
+                val fingerprint = recognized.lowercase().replace(Regex("[^a-z0-9]+"), " ").trim()
+                val now = SystemClock.elapsedRealtime()
+                if (!scanMatching && fingerprint.isNotBlank() &&
+                    (fingerprint != lastScanFingerprint || now - lastScanAt > 8000L)) {
+                    lastScanFingerprint = fingerprint
+                    lastScanAt = now
+                    scanMatching = true
+                    scanHint = "Matching your card against the catalog…"
+                    scanText = recognized
+                    scope.launch {
+                        try {
+                            val matches = if (currentSet != null && cards.isNotEmpty()) {
+                                matchScannedCard(recognized, cards)
+                            } else {
+                                catalog.findScannedCandidates(recognized)
+                            }
+                            if (matches.isNotEmpty()) {
+                                suggestions = matches
+                                scannerOpen = false
+                            } else {
+                                scanHint = "No match yet. Move closer, use better lighting or another angle."
+                            }
+                        } catch (ex: Exception) {
+                            scanHint = "Search failed. Check internet and try again."
+                        } finally {
+                            scanMatching = false
+                        }
+                    }
+                }
+            }
+        )
+    } else Scaffold(containerColor = midnight) { inset ->
         Column(Modifier.fillMaxSize().padding(inset).padding(horizontal = 16.dp)) {
             Spacer(Modifier.height(9.dp))
             if (currentSet == null) {
@@ -192,14 +204,14 @@ private fun BinderScreen() {
                         modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
                 }
                 Spacer(Modifier.height(12.dp))
-                Button(onClick = { startScan() }, enabled = !scanning,
+                Button(onClick = { startScan() },
                     modifier = Modifier.fillMaxWidth().height(57.dp),
                     shape = RoundedCornerShape(16.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = brightGold, contentColor = Color(0xFF16171E))) {
-                    Text(if (scanning) "LOOKING FOR YOUR CARD…" else "📷  SCAN A CARD",
+                    Text("📷  LIVE SCAN A CARD",
                         fontWeight = FontWeight.ExtraBold, style = MaterialTheme.typography.titleMedium)
                 }
-                Text("Scan any set • review the match before saving",
+                Text("Automatic scanning • no shutter button needed",
                     color = mutedText, style = MaterialTheme.typography.labelSmall,
                     modifier = Modifier.align(Alignment.CenterHorizontally).padding(top = 5.dp))
                 Spacer(Modifier.height(10.dp))
@@ -289,11 +301,11 @@ private fun BinderScreen() {
                     modifier = Modifier.fillMaxWidth().height(7.dp).clip(RoundedCornerShape(10.dp)),
                     color = aqua, trackColor = Color(0xFF35435E))
                 Spacer(Modifier.height(12.dp))
-                Button(onClick = { startScan() }, enabled = !scanning && !cardsLoading,
+                Button(onClick = { startScan() },
                     modifier = Modifier.fillMaxWidth().height(55.dp),
                     shape = RoundedCornerShape(15.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = brightGold, contentColor = Color(0xFF16171E))) {
-                    Text(if (scanning) "LOOKING FOR YOUR CARD…" else "📷  SCAN A CARD",
+                    Text("📷  LIVE SCAN A CARD",
                         fontWeight = FontWeight.ExtraBold, style = MaterialTheme.typography.titleMedium)
                 }
                 Spacer(Modifier.height(10.dp))
@@ -384,7 +396,7 @@ private fun BinderScreen() {
             text = {
                 Column(Modifier.heightIn(max = 410.dp).verticalScroll(rememberScrollState())) {
                     if (matches.isEmpty()) {
-                        Text("No confident match found. Try a clearer photo or select a set to add manually.")
+                        Text("No match yet. Try scanning again or select a set manually.")
                     } else {
                         Text("Choose the correct card. Nothing is saved until you choose.")
                         Spacer(Modifier.height(10.dp))
@@ -405,7 +417,7 @@ private fun BinderScreen() {
                         style = MaterialTheme.typography.bodySmall, color = mutedText)
                 }
             }, confirmButton = {
-                TextButton(onClick = { suggestions = null }) { Text("Cancel") }
+                TextButton(onClick = { suggestions = null; scannerOpen = true }) { Text("Scan again") }
             })
     }
 }
